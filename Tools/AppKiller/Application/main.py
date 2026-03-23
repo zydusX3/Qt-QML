@@ -1,5 +1,4 @@
 import sys
-import threading
 from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
@@ -9,12 +8,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTime
 
-from worker import monitor
-from utils import (
-    is_process_running,
-    load_history,
-    save_history
-)
+from worker import MonitorWorker
+from utils import is_process_running, load_history, save_history
 
 DEFAULT_PROCESS = "StreamXpress64.exe"
 
@@ -22,16 +17,15 @@ DEFAULT_PROCESS = "StreamXpress64.exe"
 class App(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RF Safety Controller v4.2")
+        self.setWindowTitle("RF Safety Controller v5")
 
         self.layout = QVBoxLayout()
 
-        # -------- INPUT SECTION --------
+        # --- Process input ---
         self.layout.addWidget(QLabel("Process Name (comma separated)"))
 
         self.process_input = QComboBox()
         self.process_input.setEditable(True)
-
         history = load_history()
         self.process_input.addItems(history)
 
@@ -46,7 +40,7 @@ class App(QWidget):
         self.mode_selector.addItems(["Idle", "Duration", "Fixed Time"])
         self.layout.addWidget(self.mode_selector)
 
-        # --- Time Input ---
+        # --- Time ---
         self.time_label = QLabel("Idle Timeout (HH:MM:SS)")
         self.time_input = QTimeEdit()
         self.time_input.setDisplayFormat("HH:mm:ss")
@@ -55,22 +49,21 @@ class App(QWidget):
         self.layout.addWidget(self.time_label)
         self.layout.addWidget(self.time_input)
 
-        # --- Shutdown option ---
+        # --- Shutdown ---
         self.shutdown_checkbox = QCheckBox("Shutdown PC after closing app")
         self.layout.addWidget(self.shutdown_checkbox)
 
-        # -------- SEPARATOR --------
+        # --- Separator ---
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
         self.layout.addWidget(line)
 
-        # -------- STATUS --------
+        # --- Timer ---
         self.timer_label = QLabel("00:00:00")
         self.timer_label.setAlignment(Qt.AlignCenter)
         self.layout.addWidget(self.timer_label)
 
-        # -------- BUTTONS --------
+        # --- Buttons ---
         self.start_btn = QPushButton("Start")
         self.stop_btn = QPushButton("Stop")
         self.reset_btn = QPushButton("Reset Timer")
@@ -81,7 +74,7 @@ class App(QWidget):
 
         self.setLayout(self.layout)
 
-        # --- Control ---
+        self.worker = None
         self.control = {"stop": False, "reset": False, "shutdown": False}
 
         # --- Connections ---
@@ -92,7 +85,7 @@ class App(QWidget):
 
         self.update_ui()
 
-    # -------- UI STATE --------
+    # -------- UI --------
     def set_inputs_enabled(self, enabled):
         self.process_input.setEnabled(enabled)
         self.mode_selector.setEnabled(enabled)
@@ -115,7 +108,11 @@ class App(QWidget):
             else:
                 self.time_label.setText("Idle Timeout (HH:MM:SS)")
 
-    # -------- HELPERS --------
+    # -------- Helpers --------
+    def parse_processes(self):
+        text = self.process_input.currentText()
+        return [p.strip() for p in text.split(",") if p.strip()]
+
     def get_duration_seconds(self):
         t = self.time_input.time()
         return t.hour() * 3600 + t.minute() * 60 + t.second()
@@ -143,11 +140,7 @@ class App(QWidget):
         s = seconds % 60
         return f"{h:02}:{m:02}:{s:02}"
 
-    def parse_processes(self):
-        text = self.process_input.currentText()
-        return [p.strip() for p in text.split(",") if p.strip()]
-
-    # -------- TIMER UPDATE --------
+    # -------- UI update from thread --------
     def update_timer(self, value):
         mode = self.mode_selector.currentText()
 
@@ -158,36 +151,30 @@ class App(QWidget):
 
         self.timer_label.setText(self.format_time(remaining))
 
-    # -------- START --------
+    def on_finished(self):
+        self.set_inputs_enabled(True)
+        self.timer_label.setText("Stopped")
+
+    # -------- Start --------
     def start_monitor(self):
         process_text = self.process_input.currentText()
         process_list = self.parse_processes()
 
-        # --- Save history ---
         save_history(process_text)
 
-        # --- Validate processes ---
-        valid = []
-        invalid = []
-
-        for p in process_list:
-            if is_process_running(p):
-                valid.append(p)
-            else:
-                invalid.append(p)
-
-        if invalid:
-            print(f"[WARN] Not running: {invalid}")
+        valid = [p for p in process_list if is_process_running(p)]
 
         if not valid:
-            print("[ERROR] No valid processes found")
+            print("[ERROR] No valid processes")
             return
 
         mode = self.mode_selector.currentText().lower()
 
-        self.control["stop"] = False
-        self.control["reset"] = False
-        self.control["shutdown"] = self.shutdown_checkbox.isChecked()
+        self.control = {
+            "stop": False,
+            "reset": False,
+            "shutdown": self.shutdown_checkbox.isChecked()
+        }
 
         timeout = None
         target_time = None
@@ -201,20 +188,20 @@ class App(QWidget):
 
         self.set_inputs_enabled(False)
 
-        threading.Thread(
-            target=monitor,
-            args=(valid, timeout, mode, target_time,
-                  self.update_timer, self.control),
-            daemon=True
-        ).start()
+        self.worker = MonitorWorker(valid, timeout, mode,
+                                    target_time, self.control)
 
-    # -------- STOP --------
+        self.worker.update_signal.connect(self.update_timer)
+        self.worker.finished_signal.connect(self.on_finished)
+
+        self.worker.start()
+
+    # -------- Stop --------
     def stop_monitor(self):
-        self.control["stop"] = True
-        self.set_inputs_enabled(True)
-        self.timer_label.setText("Stopped")
+        if self.worker:
+            self.control["stop"] = True
 
-    # -------- RESET --------
+    # -------- Reset --------
     def reset_timer(self):
         self.control["reset"] = True
 

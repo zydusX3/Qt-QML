@@ -1,66 +1,83 @@
+from PySide6.QtCore import QThread, Signal
 import time
 from datetime import datetime
 from utils import get_idle_duration, kill_process, shutdown_pc
 
 
-def monitor(process_list, timeout, mode,
-            target_time=None,
-            callback=None,
-            control=None):
+class MonitorWorker(QThread):
+    update_signal = Signal(float)
+    finished_signal = Signal()
 
-    print(f"[START] Mode={mode}, processes={process_list}")
+    def __init__(self, process_list, timeout, mode,
+                 target_time=None, control=None):
+        super().__init__()
 
-    start_time = time.time()
+        self.process_list = process_list
+        self.timeout = timeout
+        self.mode = mode
+        self.target_time = target_time
+        self.control = control or {}
 
-    while True:
-        if control and control.get("stop"):
-            print("[STOP] Monitoring stopped")
-            break
+    def run(self):
+        print(f"[START] Mode={self.mode}, processes={self.process_list}")
 
-        if mode == "duration" and control and control.get("reset"):
-            start_time = time.time()
-            control["reset"] = False
+        start_time = time.time()
 
-        if mode == "idle":
-            elapsed = get_idle_duration()
+        while True:
+            if self.control.get("stop"):
+                print("[STOP] Monitoring stopped")
+                break
 
-        elif mode == "duration":
-            elapsed = time.time() - start_time
+            # --- Reset ---
+            if self.mode == "duration" and self.control.get("reset"):
+                start_time = time.time()
+                self.control["reset"] = False
 
-        elif mode == "fixed":
-            now = datetime.now()
-            remaining = (target_time - now).total_seconds()
+            # --- Mode logic ---
+            if self.mode == "idle":
+                elapsed = get_idle_duration()
 
-            if callback:
-                callback(remaining)
+            elif self.mode == "duration":
+                elapsed = time.time() - start_time
 
-            if remaining <= 0:
-                print("\n[TRIGGER] Fixed time reached")
+            elif self.mode == "fixed":
+                now = datetime.now()
+                remaining = (self.target_time - now).total_seconds()
 
-                for p in process_list:
+                self.update_signal.emit(remaining)
+
+                if remaining <= 0:
+                    print("[TRIGGER] Fixed time reached")
+
+                    for p in self.process_list:
+                        kill_process(p)
+
+                    if self.control.get("shutdown"):
+                        shutdown_pc()
+
+                    break
+
+                time.sleep(1)
+                continue
+
+            else:
+                elapsed = 0
+
+            # --- Update UI safely ---
+            self.update_signal.emit(elapsed)
+
+            # --- Trigger ---
+            if elapsed > self.timeout:
+                print("[TRIGGER] Condition met")
+
+                for p in self.process_list:
                     kill_process(p)
 
-                if control and control.get("shutdown"):
+                if self.control.get("shutdown"):
                     shutdown_pc()
+
                 break
 
             time.sleep(1)
-            continue
 
-        else:
-            elapsed = 0
-
-        if callback:
-            callback(elapsed)
-
-        if elapsed > timeout:
-            print("\n[TRIGGER] Condition met")
-
-            for p in process_list:
-                kill_process(p)
-
-            if control and control.get("shutdown"):
-                shutdown_pc()
-            break
-
-        time.sleep(1)
+        self.finished_signal.emit()
